@@ -11,26 +11,24 @@ package zrunner
 import (
 	"io"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
 
-type MultiWriteCloser struct {
-	ws   []io.WriteCloser
+type MultiWriter struct {
+	ws   []io.Writer
 	sync bool
 	mx   *sync.Mutex
 }
 
-func NewMultiWriteCloser(w ...io.WriteCloser) *MultiWriteCloser {
-	return &MultiWriteCloser{
-		ws: append([]io.WriteCloser{}, w...),
+func NewMultiWriter(w ...io.Writer) *MultiWriter {
+	return &MultiWriter{
+		ws: append([]io.Writer{}, w...),
 	}
 }
-func (m *MultiWriteCloser) OnSync() *MultiWriteCloser {
+func (m *MultiWriter) OnSync() *MultiWriter {
 	m.sync = true
 	return m
 }
-func (m *MultiWriteCloser) Write(p []byte) (n int, err error) {
+func (m *MultiWriter) Write(p []byte) (n int, err error) {
 	if m.sync {
 		m.mx.Lock()
 		defer m.mx.Unlock()
@@ -46,11 +44,4 @@ func (m *MultiWriteCloser) Write(p []byte) (n int, err error) {
 		}
 	}
 	return len(p), err
-}
-func (m *MultiWriteCloser) Close() error {
-	g := errgroup.Group{}
-	for _, w := range m.ws {
-		g.Go(w.Close)
-	}
-	return g.Wait()
 }

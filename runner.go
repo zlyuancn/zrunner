@@ -14,8 +14,19 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"sync"
 
 	"gopkg.in/natefinch/lumberjack.v2"
+)
+
+// 运行状态
+type RunState int32
+
+const (
+	// 已停止
+	StoppedState RunState = iota
+	// 已启动
+	StartedState
 )
 
 type RunnerConfig struct {
@@ -24,13 +35,15 @@ type RunnerConfig struct {
 	Args    []string
 	Env     []string
 
-	Stdout               io.WriteCloser
+	StdIn io.Reader
+
+	Stdout               io.Writer
 	StdoutFile           string // 日志文件路径
 	StdoutFileMaxSize    int    // 每个日志文件保存的最大尺寸 单位：M
 	StdoutFileMaxBackups int    // 文件最多保存多少天
 	StdoutFileMaxAge     int    // 日志文件最多保存多少个备份
 
-	Stderr               io.WriteCloser
+	Stderr               io.Writer
 	RedirectStderr       bool // 重定向err输出到stdout
 	StderrFile           string
 	StderrFileMaxSize    int
@@ -42,12 +55,19 @@ type RunnerConfig struct {
 
 type Runner struct {
 	RunnerConfig
-	stdout io.WriteCloser
-	stderr io.WriteCloser
-	cmd    *exec.Cmd
+
+	stdoutFileWriter io.WriteCloser
+	stderrFileWriter io.WriteCloser
+
+	runState RunState // 运行状态 0=关闭, 1=运行
+
+	cmd  *exec.Cmd
+	done chan error
+
+	mx sync.Mutex
 }
 
-func NewExec(conf *RunnerConfig) (*Runner, error) {
+func NewExec(conf *RunnerConfig) *Runner {
 	r := &Runner{
 		RunnerConfig: *conf,
 	}
@@ -55,24 +75,11 @@ func NewExec(conf *RunnerConfig) (*Runner, error) {
 		r.Dir, _ = os.Getwd()
 	}
 
-	r.cmd = exec.Command(r.Command, r.Args...)
-	r.cmd.Dir = r.Dir
-	r.cmd.Env = append([]string{}, r.Env...)
-
-	if err := r.makeLogFile(); err != nil {
-		return nil, err
-	}
-
-	if r.User != "" {
-		if err := r.makeExecUser(); err != nil {
-			return nil, err
-		}
-	}
-	return r, nil
+	return r
 }
 
 func (r *Runner) makeLogFile() error {
-	var ws []io.WriteCloser
+	var ws []io.Writer
 	if r.Stdout != nil {
 		ws = append(ws, r.Stdout)
 	}
@@ -81,16 +88,15 @@ func (r *Runner) makeLogFile() error {
 		if err != nil {
 			return err
 		}
+		r.stdoutFileWriter = w
 		ws = append(ws, w)
 	}
 	if len(ws) > 0 {
-		r.stdout = NewMultiWriteCloser(ws...)
-		r.cmd.Stdout = r.stdout
+		r.cmd.Stdout = NewMultiWriter(ws...)
 	}
 
 	if r.RedirectStderr {
-		r.stderr = r.stdout
-		r.cmd.Stderr = r.stderr
+		r.cmd.Stderr = r.cmd.Stdout
 		return nil
 	}
 
@@ -103,11 +109,11 @@ func (r *Runner) makeLogFile() error {
 		if err != nil {
 			return err
 		}
+		r.stderrFileWriter = w
 		ws = append(ws, w)
 	}
 	if len(ws) > 0 {
-		r.stderr = NewMultiWriteCloser(ws...)
-		r.cmd.Stderr = r.stderr
+		r.cmd.Stderr = NewMultiWriter(ws...)
 	}
 	return nil
 }
@@ -136,19 +142,75 @@ func (r *Runner) Run() error {
 	}
 	return r.Wait()
 }
+
 func (r *Runner) Start() error {
-	return r.cmd.Start()
-}
-func (r *Runner) Wait() error {
-	if err := r.cmd.Wait(); err != nil {
+	r.mx.Lock()
+	defer r.mx.Unlock()
+
+	if r.runState != StoppedState {
+		return nil
+	}
+
+	r.cmd = exec.Command(r.Command, r.Args...)
+	r.cmd.Dir = r.Dir
+	r.cmd.Env = append([]string{}, r.Env...)
+	r.cmd.Stdin = r.StdIn
+
+	if r.User != "" {
+		if err := r.makeExecUser(); err != nil {
+			return err
+		}
+	}
+
+	if err := r.makeLogFile(); err != nil {
+		r.closeLogWriter()
 		return err
 	}
 
-	if r.stdout != nil {
-		_ = r.stdout.Close()
+	err := r.cmd.Start()
+	if err != nil {
+		r.closeLogWriter()
+		return err
 	}
-	if r.stderr != nil {
-		_ = r.stderr.Close()
-	}
+
+	r.done = make(chan error, 1)
+	r.runState = StartedState
+	go r.wait()
 	return nil
+}
+
+func (r *Runner) wait() {
+	err := r.cmd.Wait()
+
+	r.mx.Lock()
+	defer r.mx.Unlock()
+
+	r.closeLogWriter()
+	r.cmd = nil
+
+	r.runState = StoppedState
+	r.done <- err
+}
+
+func (r *Runner) closeLogWriter() {
+	if r.stdoutFileWriter != nil {
+		_ = r.stdoutFileWriter.Close()
+		r.stdoutFileWriter = nil
+	}
+	if r.stderrFileWriter != nil {
+		_ = r.stderrFileWriter.Close()
+		r.stdoutFileWriter = nil
+	}
+}
+
+func (r *Runner) Wait() error {
+	r.mx.Lock()
+	if r.runState == StoppedState {
+		r.mx.Unlock()
+		return nil
+	}
+	done := r.done
+	r.mx.Unlock()
+
+	return <-done
 }
