@@ -8,6 +8,10 @@
 
 package zrunner
 
+import (
+	"errors"
+)
+
 func (r *Runner) makeExecUser() error {
-	panic("在windows下不能设置用户")
+	return errors.New("在windows下不能设置用户")
 }
